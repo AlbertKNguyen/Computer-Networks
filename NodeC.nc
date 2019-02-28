@@ -7,6 +7,8 @@
  *
  */
 
+ //Implemented by Albert Nguyen
+
 #include <Timer.h>
 #include "includes/CommandMsg.h"
 #include "includes/packet.h"
@@ -16,15 +18,19 @@ configuration NodeC{
 implementation {
     components MainC;
     components Node;
-    components new ListC(uint16_t, 64) as seqNumber;
-    components new ListC(pack, 64) as packetSeen;
-    components new ListC(uint16_t, 64) as neighbors;
+    components new ListC(uint16_t, 64) as neighborsList;
+    components new HashmapC(uint16_t, 64) as seqNumbers;
+    components new HashmapC(uint8_t*, 64) as linkState;
+    components new HashmapC(uint16_t, 64) as nodeDistance;
+    components new HashmapC(uint16_t, 64) as routeTable;
     components new AMReceiverC(AM_PACK) as GeneralReceive;
 
     Node -> MainC.Boot;
-    Node.packetSeen -> packetSeen;
-    Node.seqNumber -> seqNumber;
-    Node.neighbors -> neighbors;
+    Node.seqNumbers -> seqNumbers;
+    Node.neighborsList -> neighborsList;
+    Node.linkState -> linkState;
+    Node.nodeDistance -> nodeDistance;
+    Node.routeTable -> routeTable;
     Node.Receive -> GeneralReceive;
     
     components new TimerMilliC() as myTimerC;
