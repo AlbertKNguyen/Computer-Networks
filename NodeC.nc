@@ -33,9 +33,11 @@ implementation {
     Node.routeTable -> routeTable;
     Node.Receive -> GeneralReceive;
     
-    components new TimerMilliC() as myTimerC;
-    Node.periodicNeighbors -> myTimerC;
-    Node.periodicLinkState -> myTimerC;
+    components new TimerMilliC() as periodicNeighbors;
+    Node.periodicNeighbors -> periodicNeighbors;
+   
+    components new TimerMilliC() as periodicLinkState;
+    Node.periodicLinkState -> periodicLinkState;
 
     components RandomC;
     Node.Random -> RandomC;

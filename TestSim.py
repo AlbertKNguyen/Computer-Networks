@@ -148,14 +148,21 @@ def main():
     s.ping(1, 5, "Hello, World?");
     s.runTime(10);
     s.ping(7, 2, "Hi!");
-    s.runTime(2000);
+    s.runTime(800);
     for i in range(1,10):
         s.printNeighbors(i);
-        s.runTime(20);
+        s.runTime(1);
+    for i in range(1,10):
+        s.printLinkState(i);
+        s.runTime(1);
     for i in range(1,10):
         s.printRouteTable(i);
-        s.runTime(20);
-
+        s.runTime(1);
+    s.runTime(100);
+    s.ping(1, 9, "Hello, World?");
+    s.runTime(10);
+    s.ping(7, 2, "Hi!");
+    s.runTime(20);
 
 if __name__ == '__main__':
     main()

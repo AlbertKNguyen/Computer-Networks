@@ -38,10 +38,10 @@ module Node {
 implementation {
     pack sendPackage, srcSeq;
     uint16_t i, j, minNode, min;
-    uint16_t nodeNeighbors[64][64];
-    uint32_t* destNode; 
-    uint32_t* linkStateNodes;
-    uint16_t* linkStateNeighbors;
+    uint16_t  nodeNeighbors[64][64];
+    uint32_t *destNode; 
+    uint32_t *linkStateNodes;
+    uint16_t *linkStateNeighbors;
     uint16_t nodeGraph[64][64];
     uint8_t isConsidered[64], nextHopNeighbor;
     uint32_t timer; 
@@ -55,7 +55,7 @@ implementation {
         call AMControl.start();
         timer = (call Random.rand32() * 37) - (570000 * (TOS_NODE_ID - 10));
         call periodicNeighbors.startPeriodic(timer);
-        //call periodicLinkState.startPeriodic(timer + 1000000);
+        call periodicLinkState.startPeriodic(timer + 10000);
         dbg(GENERAL_CHANNEL, "Booted\n");
     }
 
@@ -90,15 +90,7 @@ implementation {
                 if(myMsg->dest == AM_BROADCAST_ADDR && myMsg->TTL == 0 && myMsg->protocol == 1) {
                     dbg(FLOODING_CHANNEL, "Found Node %d as Neighbor\n", myMsg->src);
                     call neighborsList.pushfront(myMsg->src);
-                    //update route table and broadcast link-state packet
-                    updateRouteTable();
-                    for(i = 0; i < call neighborsList.size(); i++) {
-                        nodeNeighbors[TOS_NODE_ID][i] = call neighborsList.get(i);
-                    }
-                    nodeNeighbors[TOS_NODE_ID][call neighborsList.size()] = 0;
-                    makePack(&sendPackage, TOS_NODE_ID, AM_BROADCAST_ADDR, 20, 2, call seqNumbers.get(TOS_NODE_ID), nodeNeighbors[TOS_NODE_ID], PACKET_MAX_PAYLOAD_SIZE);
                     call Sender.send(sendPackage, AM_BROADCAST_ADDR);
-                    call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
                 }
                 //drop packet if the source of the packet matches node or TTL is 0
                 else if(TOS_NODE_ID == myMsg->src || myMsg->TTL == 0) {
@@ -118,8 +110,9 @@ implementation {
                 else if(myMsg->dest == AM_BROADCAST_ADDR && myMsg->protocol == 2) {
                     //copy array of neighbors from link-state packet into its own 2D array of node neighbors
                     i = 0;
-                    while(*(myMsg->payload + i) != 0) {
-                        nodeNeighbors[myMsg->src][i] = *(myMsg->payload + i);   
+                    linkStateNeighbors = myMsg->payload;
+                    while(linkStateNeighbors[i] != 0) {
+                        nodeNeighbors[myMsg->src][i] = linkStateNeighbors[i];  
                         i++;                  
                     }
                     nodeNeighbors[myMsg->src][i] = 0;  
@@ -135,7 +128,7 @@ implementation {
                 else if(call routeTable.contains(myMsg->dest)) {
                     makePack(&sendPackage, myMsg->src, myMsg->dest, --myMsg->TTL, myMsg->protocol, myMsg->seq, myMsg->payload, PACKET_MAX_PAYLOAD_SIZE);
                     call Sender.send(sendPackage, call routeTable.get(myMsg->dest));
-                    dbg(FLOODING_CHANNEL, "Packet Routed to Node %d\n", call routeTable.get(myMsg->dest));                        
+                    dbg(FLOODING_CHANNEL, "Packet forwarded to Node %d\n", call routeTable.get(myMsg->dest));                        
                 }
                 //flood if destination not in route table
                 else {
@@ -164,8 +157,16 @@ implementation {
                     }
                     //send a ping reply
                     dbg(GENERAL_CHANNEL, "PING EVENT: REPLY \n");
-                    makePack(&sendPackage, TOS_NODE_ID, myMsg->src, 20, 1, myMsg->seq, myMsg->payload, PACKET_MAX_PAYLOAD_SIZE);
-                    call Sender.send(sendPackage, AM_BROADCAST_ADDR);
+                    makePack(&sendPackage, TOS_NODE_ID, myMsg->src, 20, 1, call seqNumbers.get(TOS_NODE_ID), myMsg->payload, PACKET_MAX_PAYLOAD_SIZE);
+                    //send unicast ping reply if source of ping in route table, if not, broadcast
+                    if(call routeTable.contains(myMsg->src)) {
+                        call Sender.send(sendPackage, call routeTable.get(myMsg->src));
+                        dbg(FLOODING_CHANNEL, "Packet sent to Node %d\n", call routeTable.get(myMsg->src));                        
+                    }
+                    else {
+                        call Sender.send(sendPackage, AM_BROADCAST_ADDR);         
+                    }
+                    call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
                 }
                 call seqNumbers.insert(myMsg->src, myMsg->seq + 1);
                 return msg;
@@ -179,11 +180,18 @@ implementation {
     event void CommandHandler.ping(uint16_t destination, uint8_t *payload){
         dbg(GENERAL_CHANNEL, "PING EVENT \n");
         if(!call seqNumbers.contains(TOS_NODE_ID)) {
-             call seqNumbers.insert(TOS_NODE_ID, 0);
+            call seqNumbers.insert(TOS_NODE_ID, 0);
         }
         makePack(&sendPackage, TOS_NODE_ID, destination, 20, 0, call seqNumbers.get(TOS_NODE_ID), payload, PACKET_MAX_PAYLOAD_SIZE);
-        call Sender.send(sendPackage, AM_BROADCAST_ADDR);
-        call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
+        //send unicast if destination of ping in route table, if not, broadcast
+        if(call routeTable.contains(destination)) {
+            call Sender.send(sendPackage, call routeTable.get(destination));
+            dbg(FLOODING_CHANNEL, "Packet sent to Node %d\n", call routeTable.get(destination));                        
+        }
+        else {
+            call Sender.send(sendPackage, AM_BROADCAST_ADDR);         
+        }
+        call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);  
     }
 
     //periodic neighbor discovery pings
@@ -226,14 +234,9 @@ implementation {
         dbg(NEIGHBOR_CHANNEL, "--------------------\n");
     }
 
+    //using djkstra's algorithm make route table using given link-state info
     void updateRouteTable() {
         dbg(GENERAL_CHANNEL, "Updated Route Table\n");
-        //insert its own link-state/neighbors into link-state map
-        for(i = 0; i < call neighborsList.size(); i++) {
-            nodeNeighbors[TOS_NODE_ID][i] = call neighborsList.get(i);
-        }
-        nodeNeighbors[TOS_NODE_ID][call neighborsList.size()] = 0;
-        call linkState.insert(TOS_NODE_ID, nodeNeighbors[TOS_NODE_ID]);
         //linkStateNodes are the nodes that sent link-state packets
         linkStateNodes = call linkState.getKeys();
         //go through each node to initialize node distance 
@@ -244,7 +247,6 @@ implementation {
             j = 0;
             //go through each neighbor of node to build graph
             while(linkStateNeighbors[j] != 0) {
-                isConsidered[linkStateNodes[i]] = 0;
                 nodeGraph[linkStateNodes[i]][linkStateNeighbors[j]] = 1;
                 j++;
             }
@@ -270,6 +272,7 @@ implementation {
             while(linkStateNeighbors[j] != 0) {
                 if(!isConsidered[linkStateNeighbors[j]] && nodeGraph[minNode][linkStateNeighbors[j]] && call nodeDistance.get(minNode) != 999 
                 && call nodeDistance.get(minNode) + nodeGraph[minNode][linkStateNeighbors[j]] < call nodeDistance.get(linkStateNeighbors[j])) {
+                    //set node distance at node and insert which node is "closest" for next hop
                     call nodeDistance.insert(linkStateNeighbors[j], call nodeDistance.get(minNode) + nodeGraph[minNode][linkStateNeighbors[j]]);
                     call routeTable.insert(linkStateNeighbors[j], minNode);
                 }
@@ -285,6 +288,7 @@ implementation {
             }
             else{
                 //if the next hop of destination is not a neighbor adjust it 1 node at a time until the next hop is a neighbor
+                nextHopNeighbor = 0;
                 while(!nextHopNeighbor) {
                     for(j = 0; j < call neighborsList.size(); j++) {
                         if(call routeTable.get(destNode[i]) == call neighborsList.get(j)) {
@@ -292,7 +296,7 @@ implementation {
                         }
                     }
                     if(!nextHopNeighbor) {
-                        call routeTable.insert(destNode[i], call routeTable.get(destNode[i]));
+                        call routeTable.insert(destNode[i], call routeTable.get(call routeTable.get(destNode[i])));
                     }               
                 } 
             }
