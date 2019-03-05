@@ -34,7 +34,8 @@ implementation {
     Node.Receive -> GeneralReceive;
     
     components new TimerMilliC() as myTimerC;
-    Node.periodicTimer -> myTimerC;
+    Node.periodicNeighbors -> myTimerC;
+    Node.periodicLinkState -> myTimerC;
 
     components RandomC;
     Node.Random -> RandomC;
