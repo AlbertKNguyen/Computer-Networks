@@ -37,7 +37,7 @@ module Node {
 implementation {
     pack sendPackage, srcSeq;
     uint16_t i, j, minNode, min;
-    uint16_t nodeNeighbors[64];
+    uint16_t nodeNeighbors[64][64];
     uint32_t* destNode; 
     uint32_t* linkStateNodes;
     uint16_t* linkStateNeighbors;
@@ -89,10 +89,10 @@ implementation {
                     //update route table and broadcast link-state packet
                     updateRouteTable();
                     for(i = 0; i < call neighborsList.size(); i++) {
-                        nodeNeighbors[i] = call neighborsList.get(i);
+                        nodeNeighbors[TOS_NODE_ID][i] = call neighborsList.get(i);
                     }
-                    nodeNeighbors[call neighborsList.size()] = 0;
-                    makePack(&sendPackage, TOS_NODE_ID, AM_BROADCAST_ADDR, 20, 2, call seqNumbers.get(TOS_NODE_ID), nodeNeighbors, PACKET_MAX_PAYLOAD_SIZE);
+                    nodeNeighbors[TOS_NODE_ID][call neighborsList.size()] = 0;
+                    makePack(&sendPackage, TOS_NODE_ID, AM_BROADCAST_ADDR, 20, 2, call seqNumbers.get(TOS_NODE_ID), nodeNeighbors[TOS_NODE_ID], PACKET_MAX_PAYLOAD_SIZE);
                     call Sender.send(sendPackage, AM_BROADCAST_ADDR);
                     call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
                 }
@@ -113,8 +113,13 @@ implementation {
                 //if it is a broadcasted link-state packet, store the information and flood
                 else if(myMsg->dest == AM_BROADCAST_ADDR && myMsg->protocol == 2) {
                     //insert link-state pack into link-state map
-                    linkStateNeighbors = myMsg->payload;
-                    call linkState.insert(myMsg->src, linkStateNeighbors);
+                    i= 0;
+                    while(*(myMsg->payload + i) != 0) {
+                        nodeNeighbors[myMsg->src][i] = *(myMsg->payload + i);
+                        i++;
+                    }
+                    nodeNeighbors[myMsg->src][i] = 0;
+                    call linkState.insert(myMsg->src, nodeNeighbors[myMsg->src]);
                     //update route table and flood
                     updateRouteTable();
                     makePack(&sendPackage, myMsg->src, myMsg->dest, --myMsg->TTL, myMsg->protocol, myMsg->seq, myMsg->payload, PACKET_MAX_PAYLOAD_SIZE);
@@ -203,10 +208,10 @@ implementation {
     void updateRouteTable() {
         //insert its own link-state/neighbors into link-state map
         for(i = 0; i < call neighborsList.size(); i++) {
-            nodeNeighbors[i] = call neighborsList.get(i);
+            nodeNeighbors[TOS_NODE_ID][i] = call neighborsList.get(i);
         }
-        nodeNeighbors[call neighborsList.size()] = 0;
-        call linkState.insert(TOS_NODE_ID, nodeNeighbors);
+        nodeNeighbors[TOS_NODE_ID][call neighborsList.size()] = 0;
+        call linkState.insert(TOS_NODE_ID, nodeNeighbors[TOS_NODE_ID]);
         //linkStateNodes are the nodes that sent link-state packets
         linkStateNodes = call linkState.getKeys();
         //go through each node to initialize node distance 
