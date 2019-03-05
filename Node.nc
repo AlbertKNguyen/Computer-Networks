@@ -23,7 +23,8 @@ module Node {
     uses interface SplitControl as AMControl;
     uses interface Receive;
     uses interface Random;
-    uses interface Timer<TMilli> as periodicTimer;
+    uses interface Timer<TMilli> as periodicNeighbors;
+    uses interface Timer<TMilli> as periodicLinkState;
     uses interface List<uint16_t> as neighborsList;
     uses interface Hashmap<uint16_t> as seqNumbers;
     uses interface Hashmap<uint8_t*> as linkState;
@@ -43,6 +44,7 @@ implementation {
     uint16_t* linkStateNeighbors;
     uint16_t nodeGraph[64][64];
     uint8_t isConsidered[64], nextHopNeighbor;
+    uint32_t timer; 
 
     // Prototypes
     void makePack(pack *Package, uint16_t src, uint16_t dest, uint16_t TTL, uint16_t Protocol, uint16_t seq, uint8_t *payload, uint8_t length);
@@ -51,7 +53,9 @@ implementation {
     //on node start up
     event void Boot.booted() {
         call AMControl.start();
-        call periodicTimer.startPeriodic((call Random.rand32() * 37) - (570000 * (TOS_NODE_ID - 10)));
+        timer = (call Random.rand32() * 37) - (570000 * (TOS_NODE_ID - 10));
+        call periodicNeighbors.startPeriodic(timer);
+        //call periodicLinkState.startPeriodic(timer + 1000000);
         dbg(GENERAL_CHANNEL, "Booted\n");
     }
 
@@ -112,13 +116,14 @@ implementation {
                 }
                 //if it is a broadcasted link-state packet, store the information and flood
                 else if(myMsg->dest == AM_BROADCAST_ADDR && myMsg->protocol == 2) {
-                    //insert link-state pack into link-state map
-                    i= 0;
+                    //copy array of neighbors from link-state packet into its own 2D array of node neighbors
+                    i = 0;
                     while(*(myMsg->payload + i) != 0) {
-                        nodeNeighbors[myMsg->src][i] = *(myMsg->payload + i);
-                        i++;
+                        nodeNeighbors[myMsg->src][i] = *(myMsg->payload + i);   
+                        i++;                  
                     }
-                    nodeNeighbors[myMsg->src][i] = 0;
+                    nodeNeighbors[myMsg->src][i] = 0;  
+                    //insert array of neighbors into link-state map
                     call linkState.insert(myMsg->src, nodeNeighbors[myMsg->src]);
                     //update route table and flood
                     updateRouteTable();
@@ -182,7 +187,7 @@ implementation {
     }
 
     //periodic neighbor discovery pings
-    event void periodicTimer.fired() { 
+    event void periodicNeighbors.fired() { 
         while(!(call neighborsList.isEmpty())) {
             call neighborsList.popback();
         }
@@ -191,6 +196,22 @@ implementation {
         }
         dbg(NEIGHBOR_CHANNEL, "Neighbor Discovery Ping\n");
         makePack(&sendPackage, TOS_NODE_ID, AM_BROADCAST_ADDR, 1, 0, call seqNumbers.get(TOS_NODE_ID), "", PACKET_MAX_PAYLOAD_SIZE);
+        call Sender.send(sendPackage, AM_BROADCAST_ADDR);
+        call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
+    }
+
+    //periodic route table update and broadcast link-state packet
+    event void periodicLinkState.fired() { 
+        //update itself by inserting its own link-state/neighbors into link-state map
+        for(i = 0; i < call neighborsList.size(); i++) {
+            nodeNeighbors[TOS_NODE_ID][i] = call neighborsList.get(i);
+        }
+        nodeNeighbors[TOS_NODE_ID][call neighborsList.size()] = 0;
+        call linkState.insert(TOS_NODE_ID, nodeNeighbors[TOS_NODE_ID]);
+        //update route table then link-state broadcast
+        updateRouteTable();
+        dbg(GENERAL_CHANNEL, "PING EVENT: Link-State Broadcast\n");
+        makePack(&sendPackage, TOS_NODE_ID, AM_BROADCAST_ADDR, 20, 2, call seqNumbers.get(TOS_NODE_ID), nodeNeighbors[TOS_NODE_ID], PACKET_MAX_PAYLOAD_SIZE);
         call Sender.send(sendPackage, AM_BROADCAST_ADDR);
         call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
     }
@@ -206,6 +227,7 @@ implementation {
     }
 
     void updateRouteTable() {
+        dbg(GENERAL_CHANNEL, "Updated Route Table\n");
         //insert its own link-state/neighbors into link-state map
         for(i = 0; i < call neighborsList.size(); i++) {
             nodeNeighbors[TOS_NODE_ID][i] = call neighborsList.get(i);
@@ -222,6 +244,7 @@ implementation {
             j = 0;
             //go through each neighbor of node to build graph
             while(linkStateNeighbors[j] != 0) {
+                isConsidered[linkStateNodes[i]] = 0;
                 nodeGraph[linkStateNodes[i]][linkStateNeighbors[j]] = 1;
                 j++;
             }
@@ -286,7 +309,22 @@ implementation {
         dbg(ROUTING_CHANNEL, "----------------------\n");
     }
 
-    event void CommandHandler.printLinkState(){}
+    event void CommandHandler.printLinkState() {
+        dbg(ROUTING_CHANNEL, "Link-State Advertisements\n");
+        //linkStateNodes are the nodes that sent link-state packets
+        linkStateNodes = call linkState.getKeys();
+        //go through each node
+        for(i = 0; i < call linkState.size(); i++) {
+            dbg(ROUTING_CHANNEL, "Neighbors of Node %d\n", linkStateNodes[i]);
+            linkStateNeighbors = call linkState.get(linkStateNodes[i]);
+            j = 0;
+            //go through each neighbor of node to build graph
+            while(linkStateNeighbors[j] != 0) {
+                dbg(ROUTING_CHANNEL, "          %d\n", linkStateNeighbors[j]);
+                j++;
+            }
+        }
+    }
 
     event void CommandHandler.printDistanceVector(){}
 
