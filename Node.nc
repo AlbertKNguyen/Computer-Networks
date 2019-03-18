@@ -36,14 +36,14 @@ module Node {
 }
 
 implementation {
-    pack sendPackage, srcSeq;
+    pack sendPackage;
     uint16_t i, j, minNode, min;
-    uint16_t  nodeNeighbors[64][64];
+    uint16_t nodeNeighbors[64][64];
     uint32_t *destNode; 
     uint32_t *linkStateNodes;
     uint16_t *linkStateNeighbors;
     uint16_t nodeGraph[64][64];
-    uint8_t isConsidered[64], nextHopNeighbor;
+    bool isConsidered[64], nextHopNeighbor;
     uint32_t timer; 
 
     // Prototypes
@@ -218,7 +218,7 @@ implementation {
         call linkState.insert(TOS_NODE_ID, nodeNeighbors[TOS_NODE_ID]);
         //update route table then link-state broadcast
         updateRouteTable();
-        dbg(GENERAL_CHANNEL, "PING EVENT: Link-State Broadcast\n");
+        dbg(GENERAL_CHANNEL, "Link-State Broadcast\n");
         makePack(&sendPackage, TOS_NODE_ID, AM_BROADCAST_ADDR, 20, 2, call seqNumbers.get(TOS_NODE_ID), nodeNeighbors[TOS_NODE_ID], PACKET_MAX_PAYLOAD_SIZE);
         call Sender.send(sendPackage, AM_BROADCAST_ADDR);
         call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
@@ -237,17 +237,23 @@ implementation {
     //using djkstra's algorithm make route table using given link-state info
     void updateRouteTable() {
         dbg(GENERAL_CHANNEL, "Updated Route Table\n");
+        //reset route table
+        destNode = call routeTable.getKeys();
+        for(i = 0; i < call routeTable.size(); i++) {
+            call routeTable.remove(destNode[i]);
+        }
         //linkStateNodes are the nodes that sent link-state packets
         linkStateNodes = call linkState.getKeys();
         //go through each node to initialize node distance 
         for(i = 0; i < call linkState.size(); i++) {
             call nodeDistance.insert(linkStateNodes[i], 999);
-            isConsidered[linkStateNodes[i]] = 0;
+            isConsidered[linkStateNodes[i]] = FALSE;
             linkStateNeighbors = call linkState.get(linkStateNodes[i]);
             j = 0;
-            //go through each neighbor of node to build graph
+            //go through each neighbor of node to build graph and set node distance of neighbors
             while(linkStateNeighbors[j] != 0) {
                 nodeGraph[linkStateNodes[i]][linkStateNeighbors[j]] = 1;
+                call nodeDistance.insert(linkStateNeighbors[j], 999);
                 j++;
             }
         }
@@ -265,7 +271,7 @@ implementation {
             }
             j = 0;
             //mark the node
-            isConsidered[minNode] = 1;
+            isConsidered[minNode] = TRUE;
             //set variable to neighbors of considered node
             linkStateNeighbors = call linkState.get(minNode);
             //go through each neighbor of node and calculate distance values
@@ -287,12 +293,12 @@ implementation {
                 call routeTable.insert(destNode[i], destNode[i]);
             }
             else{
-                //if the next hop of destination is not a neighbor adjust it 1 node at a time until the next hop is a neighbor
-                nextHopNeighbor = 0;
+                //if the next hop of destination is not a neighbor, adjust it 1 node at a time until the next hop is a neighbor
+                nextHopNeighbor = FALSE;
                 while(!nextHopNeighbor) {
                     for(j = 0; j < call neighborsList.size(); j++) {
                         if(call routeTable.get(destNode[i]) == call neighborsList.get(j)) {
-                            nextHopNeighbor = 1;
+                            nextHopNeighbor = TRUE;
                         }
                     }
                     if(!nextHopNeighbor) {
