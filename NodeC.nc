@@ -7,7 +7,7 @@
  *
  */
 
- //Implemented by Albert Nguyen
+//Implemented by Albert Nguyen
 
 #include <Timer.h>
 #include "includes/CommandMsg.h"

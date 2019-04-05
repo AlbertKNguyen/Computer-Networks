@@ -7,7 +7,7 @@
  *
  */
 
-//Implremented by Albert Nguyen
+//Implemented by Albert Nguyen
 
 #include <Timer.h>
 #include "includes/command.h"
@@ -15,6 +15,7 @@
 #include "includes/CommandMsg.h"
 #include "includes/sendInfo.h"
 #include "includes/channels.h"
+#include "includes/socket.h"
 
 
 module Node {
@@ -37,19 +38,24 @@ module Node {
 
 implementation {
     pack sendPackage;
-    uint16_t i, j, minNode, min;
-    uint16_t nodeNeighbors[64][64];
+    uint16_t i, j, minNode, min, data;
+    uint16_t nodeNeighbors[64][64], oldNeighbors[64];
     uint32_t *destNode; 
     uint32_t *linkStateNodes;
     uint16_t *linkStateNeighbors;
     uint16_t nodeGraph[64][64];
     bool isConsidered[64], nextHopNeighbor;
-    uint32_t timer; 
+    uint32_t timer;
+    socket_t fd;
+    socket_store_t sockets[64];
 
     // Prototypes
     void makePack(pack *Package, uint16_t src, uint16_t dest, uint16_t TTL, uint16_t Protocol, uint16_t seq, uint8_t *payload, uint8_t length);
     void updateRouteTable();
-
+    uint16_t socket();
+    void bind(uint16_t fd, uint16_t port);
+    void close(uint16_t fileD);
+    
     //on node start up
     event void Boot.booted() {
         call AMControl.start();
@@ -196,12 +202,14 @@ implementation {
 
     //periodic neighbor discovery pings
     event void periodicNeighbors.fired() { 
+        //reset neighbors list
         while(!(call neighborsList.isEmpty())) {
             call neighborsList.popback();
         }
         if(!call seqNumbers.contains(TOS_NODE_ID)) {
-             call seqNumbers.insert(TOS_NODE_ID, 0);
+            call seqNumbers.insert(TOS_NODE_ID, 0);
         }
+        //broadcast neighbor ping
         dbg(NEIGHBOR_CHANNEL, "Neighbor Discovery Ping\n");
         makePack(&sendPackage, TOS_NODE_ID, AM_BROADCAST_ADDR, 1, 0, call seqNumbers.get(TOS_NODE_ID), "", PACKET_MAX_PAYLOAD_SIZE);
         call Sender.send(sendPackage, AM_BROADCAST_ADDR);
@@ -300,6 +308,10 @@ implementation {
                         if(call routeTable.get(destNode[i]) == call neighborsList.get(j)) {
                             nextHopNeighbor = TRUE;
                         }
+                        else if(call routeTable.get(destNode[i]) == destNode[i]) {
+                            nextHopNeighbor = TRUE;
+                            j = call neighborsList.size();
+                        }
                     }
                     if(!nextHopNeighbor) {
                         call routeTable.insert(destNode[i], call routeTable.get(call routeTable.get(destNode[i])));
@@ -330,7 +342,7 @@ implementation {
             j = 0;
             //go through each neighbor of node to build graph
             while(linkStateNeighbors[j] != 0) {
-                dbg(ROUTING_CHANNEL, "          %d\n", linkStateNeighbors[j]);
+                dbg(ROUTING_CHANNEL, "         %d\n", linkStateNeighbors[j]);
                 j++;
             }
         }
@@ -338,9 +350,31 @@ implementation {
 
     event void CommandHandler.printDistanceVector(){}
 
-    event void CommandHandler.setTestServer(){}
+    uint16_t socket() {
+        static uint16_t fileD = 0;
+        return fileD++;
+    }
 
-    event void CommandHandler.setTestClient(){}
+    void bind(uint16_t fileD, uint16_t port) {
+        sockets[fileD].dest.addr = TOS_NODE_ID;
+        sockets[fileD].dest.addr = port;
+    }
+    
+    void close(uint16_t fileD) {
+        sockets[fileD].state = CLOSED;
+    }
+
+    event void CommandHandler.setTestServer() {
+        fd = socket();
+    }
+
+    event void CommandHandler.setTestClient() {
+
+    }
+
+    event void CommandHandler.closeTestClient() {
+
+    }
 
     event void CommandHandler.setAppServer(){}
 
