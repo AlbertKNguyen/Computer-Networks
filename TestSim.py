@@ -15,8 +15,8 @@ class TestSim:
     CMD_LINKSTATE_DUMP = 2
     CMD_ROUTE_DUMP = 3
     CMD_TEST_CLIENT = 4
-	CMD_TEST_SERVER = 5
-
+    CMD_TEST_SERVER = 5
+    
     # CHANNELS - see includes/channels.h
     COMMAND_CHANNEL="command";
     GENERAL_CHANNEL="general";
@@ -132,13 +132,13 @@ class TestSim:
         self.sendCMD(self.CMD_ROUTE_DUMP, ID, "routing command");
 
     def setTestServer(self, ID, port):
-        self.sendCMD(self.CMD_CMD_TEST_SERVER, ID, port, "transport command");
+        self.sendCMD(self.CMD_TEST_SERVER, ID, "{0}{1}".format(chr(port), "server command"));
 
     def setTestClient(self, ID, dest, srcPort, destPort, transfer):
-        self.sendCMD(self.CMD_TEST_CLIENT, ID, dest, srcPort, destPort, transfer, "transport command");
+        self.sendCMD(self.CMD_TEST_CLIENT, ID, "{0}{1}{2}{3}{4}".format(chr(dest), chr(srcPort), chr(destPort), chr(transfer), "client command"));
         
     def closeTestClient(self, ID, dest, srcPort, destPort):
-        self.sendCMD(self.CMD_TEST_CLIENT, ID, dest, srcPort, destPort, "transport command");
+        self.sendCMD(self.CMD_CLOSE_CLIENT, ID, "{0}{1}{2}{3}".format(chr(dest), chr(srcPort), chr(destPort), "client command"));
 
     def addChannel(self, channelName, out=sys.stdout):
         print 'Adding Channel', channelName;
@@ -158,33 +158,11 @@ def main():
     s.addChannel(s.TRANSPORT_CHANNEL);
     s.runTime(20);
     s.ping(1, 5, "Hello, World?");
+    s.runTime(100);
+    s.setTestServer(5, 23);
     s.runTime(10);
-    s.ping(7, 2, "Hi!");
-    s.runTime(800);
-    for i in range(1,10):
-        s.printNeighbors(i);
-        s.runTime(1);
-    for i in range(1,10):
-        s.printLinkState(i);
-        s.runTime(1);
-    for i in range(1,10):
-        s.printRouteTable(i);
-        s.runTime(1);
-    s.moteOff(3);
-    s.runTime(800);
-    for i in range(1,10):
-        s.printNeighbors(i);
-        s.runTime(1);
-    for i in range(1,10):
-        s.printLinkState(i);
-        s.runTime(1);
-    for i in range(1,10):
-        s.printRouteTable(i);
-        s.runTime(1);
-    s.ping(1, 9, "Hello, World?");
-    s.runTime(10);
-    s.ping(6, 2, "Hi!");
-    s.runTime(20);
+    s.setTestClient(1, 5, 123, 23, 40);
+    s.runTime(100);
 
 if __name__ == '__main__':
     main()

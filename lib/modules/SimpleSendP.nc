@@ -120,7 +120,7 @@ implementation{
           // We are putting data into the payload of the pkt struct. getPayload
           // aquires the payload pointer from &pkt and we type cast it to our own
           // packet type.
-         pack* msg = (pack *)(call Packet.getPayload(&pkt, sizeof(pack) ));
+         pack* msg = (pack *)(call Packet.getPayload(&pkt, sizeof(message) ));
 
          // This coppies the data we have in our message to this new packet type.
          *msg = *message;

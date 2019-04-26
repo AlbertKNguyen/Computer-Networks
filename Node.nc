@@ -16,7 +16,7 @@
 #include "includes/sendInfo.h"
 #include "includes/channels.h"
 #include "includes/socket.h"
-
+#include "includes/TCPPacket.h"
 
 module Node {
     uses interface Boot;
@@ -26,6 +26,8 @@ module Node {
     uses interface Random;
     uses interface Timer<TMilli> as periodicNeighbors;
     uses interface Timer<TMilli> as periodicLinkState;
+    uses interface Timer<TMilli> as serverTimer;
+    uses interface Timer<TMilli> as clientTimer;
     uses interface List<uint16_t> as neighborsList;
     uses interface Hashmap<uint16_t> as seqNumbers;
     uses interface Hashmap<uint8_t*> as linkState;
@@ -38,27 +40,39 @@ module Node {
 
 implementation {
     pack sendPackage;
-    uint16_t i, j, minNode, min, data;
+    tcp_pack tcpPack;
+    uint8_t transferBuff[128], readBuff[128];
+    uint16_t i, j, k, l, m, minNode, min, data, currentTransfer, dataVal;
     uint16_t nodeNeighbors[64][64], oldNeighbors[64];
     uint32_t *destNode; 
     uint32_t *linkStateNodes;
     uint16_t *linkStateNeighbors;
     uint16_t nodeGraph[64][64];
     bool isConsidered[64], nextHopNeighbor;
-    uint32_t timer;
+    uint32_t timer, packetTimer, timeout;
     socket_t fd;
-    socket_store_t sockets[64];
+    socket_store_t sockets[MAX_NUM_OF_SOCKETS];
+    socket_store_t newSocket, *tempSocket, acceptedSockets[MAX_NUM_OF_SOCKETS][MAX_NUM_OF_SOCKETS];
+    socket_addr_t socketAddress;
 
-    // Prototypes
+    //Prototypes
     void makePack(pack *Package, uint16_t src, uint16_t dest, uint16_t TTL, uint16_t Protocol, uint16_t seq, uint8_t *payload, uint8_t length);
+    void makeTcpPack(tcp_pack *tcpPack, uint8_t srcPort, uint8_t destPort, uint16_t seq, uint16_t ack, uint16_t lastAck, uint8_t flag, uint16_t window, uint8_t *payload, uint8_t length);
     void updateRouteTable();
-    uint16_t socket();
-    void bind(uint16_t fd, uint16_t port);
-    void close(uint16_t fileD);
-    
+    socket_t socket();
+    error_t bind(socket_t fileD, socket_addr_t *socketAddress);
+    error_t connect(socket_t fileD, socket_addr_t *socketAddress);
+    error_t listen(socket_t fileD);
+    socket_t accept(socket_t fd);
+    error_t close(socket_t fileD);
+    uint16_t write(socket_t fileD, uint8_t *buff, uint16_t bufflen);
+    uint16_t read(socket_t fileD, uint8_t *buff, uint16_t bufflen);
+    error_t receive(pack* package);
+
     //on node start up
     event void Boot.booted() {
         call AMControl.start();
+        makeTcpPack(&tcpPack, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         timer = (call Random.rand32() * 37) - (570000 * (TOS_NODE_ID - 10));
         call periodicNeighbors.startPeriodic(timer);
         call periodicLinkState.startPeriodic(timer + 10000);
@@ -80,7 +94,7 @@ implementation {
     //when node receives a packet
     event message_t* Receive.receive(message_t* msg, void* payload, uint8_t len) {
         pack* myMsg=(pack*) payload;
-        dbg(GENERAL_CHANNEL, "Packet Received. Src: %d Dest: %d TTL: %d Protocol: %d Seq: %d\n",  myMsg->src, myMsg->dest, myMsg->TTL, myMsg->protocol, myMsg->seq);
+        logPack(myMsg);
         if(len==sizeof(pack)) {
             //if packet destination does not mach node
             if(TOS_NODE_ID != myMsg->dest) {
@@ -93,7 +107,7 @@ implementation {
                     }
                 }
                 //if packet is a neighbor ping reply, then source is neighbor
-                if(myMsg->dest == AM_BROADCAST_ADDR && myMsg->TTL == 0 && myMsg->protocol == 1) {
+                if(myMsg->dest == AM_BROADCAST_ADDR && myMsg->TTL == 0 && myMsg->protocol == PROTOCOL_PINGREPLY) {
                     dbg(FLOODING_CHANNEL, "Found Node %d as Neighbor\n", myMsg->src);
                     call neighborsList.pushfront(myMsg->src);
                     call Sender.send(sendPackage, AM_BROADCAST_ADDR);
@@ -103,17 +117,17 @@ implementation {
                     dbg(GENERAL_CHANNEL, "Packet Dropped\n");
                 }   
                 //if it is a neighbor ping, send out a neighbor ping reply
-                else if(myMsg->dest == AM_BROADCAST_ADDR && myMsg->TTL == 1 && myMsg->protocol == 0) {
+                else if(myMsg->dest == AM_BROADCAST_ADDR && myMsg->TTL == 1 && myMsg->protocol == PROTOCOL_PING) {
                     if(!call seqNumbers.contains(TOS_NODE_ID)) {
                         call seqNumbers.insert(TOS_NODE_ID, 0);
                     }                    
                     dbg(NEIGHBOR_CHANNEL, "Neighbor Discovery Ping Reply\n");
-                    makePack(&sendPackage, TOS_NODE_ID, AM_BROADCAST_ADDR, 0, 1, call seqNumbers.get(TOS_NODE_ID), myMsg->payload, PACKET_MAX_PAYLOAD_SIZE);
+                    makePack(&sendPackage, TOS_NODE_ID, AM_BROADCAST_ADDR, 0, PROTOCOL_PINGREPLY, call seqNumbers.get(TOS_NODE_ID), myMsg->payload, PACKET_MAX_PAYLOAD_SIZE);
                     call Sender.send(sendPackage, myMsg->src);
                     call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
                 }
                 //if it is a broadcasted link-state packet, store the information and flood
-                else if(myMsg->dest == AM_BROADCAST_ADDR && myMsg->protocol == 2) {
+                else if(myMsg->dest == AM_BROADCAST_ADDR && myMsg->protocol == PROTOCOL_LINKSTATE) {
                     //copy array of neighbors from link-state packet into its own 2D array of node neighbors
                     i = 0;
                     linkStateNeighbors = myMsg->payload;
@@ -146,7 +160,7 @@ implementation {
                 return msg;                     
             }
             //if packet destination matches node
-            else {
+            else { 
                 //if source's sequence number is in map, compare sequence number in map to packet's
                 if(call seqNumbers.contains(myMsg->src)) {
                     //if same/old packet was received, drop packet
@@ -155,24 +169,36 @@ implementation {
                         return msg;
                     }
                 }
-                dbg(GENERAL_CHANNEL, "Package Payload: %s\n", myMsg->payload);
-                //if it is a new ping and not a ping reply
-                if(myMsg->protocol == 0) {
+                //if it is a ping reply, just read message
+                if(myMsg->protocol == PROTOCOL_PINGREPLY) {
+                    dbg(GENERAL_CHANNEL, "Package Payload: %s\n", myMsg->payload);
+                }
+                //if it is a new ping, read message and send ping reply
+                else if(myMsg->protocol == PROTOCOL_PING) {
+                    dbg(GENERAL_CHANNEL, "Package Payload: %s\n", myMsg->payload);
                     if(!call seqNumbers.contains(TOS_NODE_ID)) {
                         call seqNumbers.insert(TOS_NODE_ID, 0);
                     }
                     //send a ping reply
                     dbg(GENERAL_CHANNEL, "PING EVENT: REPLY \n");
-                    makePack(&sendPackage, TOS_NODE_ID, myMsg->src, 20, 1, call seqNumbers.get(TOS_NODE_ID), myMsg->payload, PACKET_MAX_PAYLOAD_SIZE);
+                    makePack(&sendPackage, TOS_NODE_ID, myMsg->src, MAX_TTL, PROTOCOL_PINGREPLY, call seqNumbers.get(TOS_NODE_ID), myMsg->payload, PACKET_MAX_PAYLOAD_SIZE);
                     //send unicast ping reply if source of ping in route table, if not, broadcast
                     if(call routeTable.contains(myMsg->src)) {
                         call Sender.send(sendPackage, call routeTable.get(myMsg->src));
                         dbg(FLOODING_CHANNEL, "Packet sent to Node %d\n", call routeTable.get(myMsg->src));                        
                     }
-                    else {
+                    else {  
                         call Sender.send(sendPackage, AM_BROADCAST_ADDR);         
                     }
                     call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
+                }
+                //if it is a tcp packet
+                else if(myMsg->protocol == PROTOCOL_TCP) {  
+                    receive(myMsg);
+                }
+                //error if packet protocol is not valid
+                else {
+                    dbg(GENERAL_CHANNEL, "ERROR: INVALID PACKET PROTOCOL\n");
                 }
                 call seqNumbers.insert(myMsg->src, myMsg->seq + 1);
                 return msg;
@@ -188,7 +214,7 @@ implementation {
         if(!call seqNumbers.contains(TOS_NODE_ID)) {
             call seqNumbers.insert(TOS_NODE_ID, 0);
         }
-        makePack(&sendPackage, TOS_NODE_ID, destination, 20, 0, call seqNumbers.get(TOS_NODE_ID), payload, PACKET_MAX_PAYLOAD_SIZE);
+        makePack(&sendPackage, TOS_NODE_ID, destination, MAX_TTL, PROTOCOL_PING, call seqNumbers.get(TOS_NODE_ID), payload, PACKET_MAX_PAYLOAD_SIZE);
         //send unicast if destination of ping in route table, if not, broadcast
         if(call routeTable.contains(destination)) {
             call Sender.send(sendPackage, call routeTable.get(destination));
@@ -211,7 +237,7 @@ implementation {
         }
         //broadcast neighbor ping
         dbg(NEIGHBOR_CHANNEL, "Neighbor Discovery Ping\n");
-        makePack(&sendPackage, TOS_NODE_ID, AM_BROADCAST_ADDR, 1, 0, call seqNumbers.get(TOS_NODE_ID), "", PACKET_MAX_PAYLOAD_SIZE);
+        makePack(&sendPackage, TOS_NODE_ID, AM_BROADCAST_ADDR, 1, PROTOCOL_PING, call seqNumbers.get(TOS_NODE_ID), "", PACKET_MAX_PAYLOAD_SIZE);
         call Sender.send(sendPackage, AM_BROADCAST_ADDR);
         call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
     }
@@ -227,7 +253,7 @@ implementation {
         //update route table then link-state broadcast
         updateRouteTable();
         dbg(GENERAL_CHANNEL, "Link-State Broadcast\n");
-        makePack(&sendPackage, TOS_NODE_ID, AM_BROADCAST_ADDR, 20, 2, call seqNumbers.get(TOS_NODE_ID), nodeNeighbors[TOS_NODE_ID], PACKET_MAX_PAYLOAD_SIZE);
+        makePack(&sendPackage, TOS_NODE_ID, AM_BROADCAST_ADDR, MAX_TTL, PROTOCOL_LINKSTATE, call seqNumbers.get(TOS_NODE_ID), nodeNeighbors[TOS_NODE_ID], PACKET_MAX_PAYLOAD_SIZE);
         call Sender.send(sendPackage, AM_BROADCAST_ADDR);
         call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
     }
@@ -350,42 +376,538 @@ implementation {
 
     event void CommandHandler.printDistanceVector(){}
 
-    uint16_t socket() {
-        static uint16_t fileD = 0;
-        return fileD++;
+    event void CommandHandler.setTestServer(uint8_t port) {
+        fd = socket();
+        socketAddress.addr = TOS_NODE_ID;
+        socketAddress.port = port;
+        if(bind(fd, &socketAddress) == SUCCESS) {
+            if(listen(fd) == SUCCESS) {
+                call serverTimer.startPeriodic(10000);
+            }
+            else {
+                dbg(TRANSPORT_CHANNEL, "FAILED TO SET UP PORT TO LISTEN\n"); 
+            }
+        }
+        else {
+            dbg(TRANSPORT_CHANNEL, "FAILED TO SET UP TEST SERVER\n"); 
+        }
     }
 
-    void bind(uint16_t fileD, uint16_t port) {
-        sockets[fileD].dest.addr = TOS_NODE_ID;
-        sockets[fileD].dest.addr = port;
+    event void CommandHandler.setTestClient(uint16_t dest, uint8_t srcPort, uint8_t destPort, uint16_t transfer) {
+        fd = socket();
+        socketAddress.addr = TOS_NODE_ID;
+        socketAddress.port = srcPort;
+        if(bind(fd, &socketAddress) == SUCCESS) {
+            dbg(TRANSPORT_CHANNEL, "Socket binded to Port: %d\n", srcPort);
+            socketAddress.addr = dest;
+            socketAddress.port = destPort;
+            if(connect(fd, &socketAddress) == SUCCESS) {
+                dbg(TRANSPORT_CHANNEL, "Attempting to connect to Node: %d Port: %d...\n", dest, destPort);
+                call clientTimer.startPeriodic(10000);
+                currentTransfer = 1;
+                data = transfer;
+            }
+        }
+        else {
+            dbg(TRANSPORT_CHANNEL, "FAILED TO SET UP TEST CLIENT\n");
+        }
+    }
+
+    event void CommandHandler.closeTestClient(uint16_t dest, uint8_t srcPort, uint8_t destPort) {
+        for(i = 0; i < MAX_NUM_OF_SOCKETS; i++) {
+            if(srcPort == sockets[i].src && destPort == sockets[i].dest.port && dest == sockets[i].dest.addr) {
+                close(i);
+                break;
+            }
+        }
+    }
+
+    //creates socket
+    socket_t socket() {
+        static socket_t fileD = 0;
+        if(fileD < MAX_NUM_OF_SOCKETS) {
+            //initializes socket
+            sockets[fileD] = socket_default;
+            return fileD++; 
+        }
+        else {
+            //find next available socket
+            for(i = 0; i < MAX_NUM_OF_SOCKETS; i++) {
+                if(sockets[fileD].state == 0) {
+                    return i;
+                }
+            }
+            return MAX_NUM_OF_SOCKETS;
+        }
+    }
+
+    //bind socket to port
+    error_t bind(socket_t fileD, socket_addr_t *socketAddress) {
+        if(fileD < MAX_NUM_OF_SOCKETS && sockets[fileD].state == CLOSED) {
+            sockets[fileD].dest = *socketAddress;
+            return SUCCESS; 
+        }
+        else {
+            dbg(TRANSPORT_CHANNEL, "Failed to bind. Current socket state: %d\n", sockets[fileD].state);
+            return FAIL;
+        }
     }
     
-    void close(uint16_t fileD) {
-        sockets[fileD].state = CLOSED;
+    error_t connect(socket_t fileD, socket_addr_t *socketAddress) {
+        if(fileD < MAX_NUM_OF_SOCKETS && sockets[fileD].state == CLOSED) {
+            //Send initial SYN
+            makeTcpPack(&tcpPack, sockets[fileD].dest.port, socketAddress->port, 0, 0, 0, SYN, 8, "", PACKET_MAX_PAYLOAD_SIZE);
+            makePack(&sendPackage, TOS_NODE_ID, socketAddress->addr, MAX_TTL, PROTOCOL_TCP, call seqNumbers.get(TOS_NODE_ID), (uint8_t*)&tcpPack, PACKET_MAX_PAYLOAD_SIZE);
+            //forward if destination in route table
+            if(call routeTable.contains(socketAddress->addr)) {
+                call Sender.send(sendPackage, call routeTable.get(socketAddress->addr));
+                dbg(FLOODING_CHANNEL, "SYN Packet sent to Node %d\n", call routeTable.get(socketAddress->addr));                        
+            }
+            //flood if destination not in route table
+            else {
+                call Sender.send(sendPackage, AM_BROADCAST_ADDR);
+                dbg(FLOODING_CHANNEL, "SYN Packet Flooded\n"); 
+            }
+            call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
+            sockets[fileD].state = SYN_SENT;
+            packetTimer = call clientTimer.getNow();
+            return SUCCESS; 
+        }
+        else {
+            return FAIL;
+        }
+    }
+    
+    error_t listen(socket_t fileD) {
+        if(fileD < MAX_NUM_OF_SOCKETS && sockets[fileD].state == CLOSED) {
+            dbg(TRANSPORT_CHANNEL, "Port: %d is now listening\n", sockets[fileD].dest.port);
+            sockets[fileD].state = LISTEN;
+            return SUCCESS; 
+        }
+        else {
+            return FAIL;
+        }
     }
 
-    event void CommandHandler.setTestServer() {
-        fd = socket();
+    socket_t accept(socket_t fileD) {
+        if(sockets[fileD].state == ESTABLISHED) {
+            return fileD;
+        }
+        else {
+            return MAX_NUM_OF_SOCKETS; 
+        }
     }
 
-    event void CommandHandler.setTestClient() {
-
+    error_t close(socket_t fileD) {
+        if(fileD < MAX_NUM_OF_SOCKETS) {
+            //if client, send FIN
+            if(sockets[fileD].src != sockets[fileD].dest.port) {
+                sockets[fileD].state = CLOSED;
+                makeTcpPack(&tcpPack, sockets[fileD].src, sockets[fileD].dest.port, 0, 0, 0, FIN, 0, "", PACKET_MAX_PAYLOAD_SIZE);
+                makePack(&sendPackage, TOS_NODE_ID, sockets[fileD].dest.addr, MAX_TTL, PROTOCOL_TCP, call seqNumbers.get(TOS_NODE_ID), "", PACKET_MAX_PAYLOAD_SIZE);
+                //forward if destination in route table
+                if(call routeTable.contains(sockets[fileD].dest.addr)) {
+                    call Sender.send(sendPackage, call routeTable.get(sockets[fileD].dest.addr));
+                    dbg(FLOODING_CHANNEL, "FIN Packet sent to Node %d\n", call routeTable.get(sockets[fileD].dest.addr));                        
+                }
+                //flood if destination not in route table
+                else {
+                    call Sender.send(sendPackage, AM_BROADCAST_ADDR);
+                    dbg(FLOODING_CHANNEL, "FIN Packet Flooded\n"); 
+                }
+                call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
+            }
+            //if server, just close
+            else{
+                sockets[fileD] = socket_default;
+                return SUCCESS;    
+            }
+        }
+        else {
+            return FAIL;
+        }
     }
 
-    event void CommandHandler.closeTestClient() {
+    //write buff to socket
+    uint16_t write(socket_t fileD, uint8_t *buff, uint16_t bufflen) {
+        if(bufflen > 128) {
+            j = 128;
+        }
+        else {
+            j = bufflen;
+        }
+        k = 0;
+        l = 0;
+        for(i = sockets[fileD].lastWritten % 127; i < (sockets[fileD].lastWritten + j); i++) {
+            if(sockets[fileD].flag == 1) {
+                sockets[fileD].sendBuff[i % 128] = buff[k];
+                sockets[fileD].sendBuff[(i + 1) % 128] = buff[k+1];
+                k += 2;
+                i++;
+            }
+            else {
+                sockets[fileD].sendBuff[i % 128] = buff[k];
+                k++;
+            }
+            l++;
+            dbg(TRANSPORT_CHANNEL, "%d, \n", sockets[fileD].sendBuff[i]);
+        }
+        sockets[fileD].lastWritten = i;
+        dbg(TRANSPORT_CHANNEL, "%d Written\n", l);
+        return l;
+    }
 
+    //write socket to buff and read buff
+    uint16_t read(socket_t fileD, uint8_t *buff, uint16_t bufflen) {
+        if(bufflen > 128) {
+            j = 128;
+        }
+        else{
+            j = bufflen;
+        }
+        //find correct accepted client socket for sendBuff
+        tempSocket = acceptedSockets[fileD];
+        for(i = 0; i < MAX_NUM_OF_SOCKETS; i ++) {
+            if(sockets[fileD].src == tempSocket[i].src && sockets[fileD].dest.addr == tempSocket[i].dest.addr && sockets[fileD].dest.port == tempSocket[i].dest.port) {
+                newSocket = tempSocket[i];
+                k = i;
+                i = MAX_NUM_OF_SOCKETS;
+            }
+        }
+        buff = newSocket.rcvdBuff;
+        l = 0;
+        m = (newSocket.lastRead + 1) % 128;
+        if(newSocket.lastRead == 0 && buff[0] == 1 && buff[1] == 2) {
+            m--;
+        }
+        dbg(TRANSPORT_CHANNEL, "Reading Data:\n");
+        for(i = newSocket.lastRead; i < (newSocket.lastRead + j); i++) {
+            dataVal = 0;
+            if(buff[m] == 255 && buff[m-1] == 255) {
+                newSocket.flag = 1;
+            }
+            if(newSocket.flag == 1) {
+                dataVal = buff[m];
+                dataVal = dataVal << 8;
+                dataVal |= buff[(m+1) % 128];
+                i++;
+            }
+            else {
+                dataVal = buff[m];
+            }
+            dbg(TRANSPORT_CHANNEL, "%d, \n", dataVal);
+            l++;
+            m = (m + 1) % 128;
+        }
+        newSocket.lastRead = m;
+        acceptedSockets[fileD][k] = newSocket;
+        return l;
+    }
+
+    error_t receive(pack* package) {
+        tcp_pack *tcp = (tcp_pack*)package->payload;
+        dbg(TRANSPORT_CHANNEL, "TCP Packet Received with Flag: %hhu SrcPort: %hhu DestPort: %hhu\n", tcp->flag, tcp->srcPort, tcp->destPort);
+        if(tcp->flag == SYN) {
+            for(i = 0; i < MAX_NUM_OF_SOCKETS; i++) {
+                if(sockets[i].dest.port == tcp->destPort && sockets[i].state == LISTEN) {
+                    //send SYN_ACK
+                    makeTcpPack(&tcpPack, sockets[i].dest.port, tcp->srcPort, 0, 0, 0, SYN_ACK, 6, "", PACKET_MAX_PAYLOAD_SIZE);
+                    makePack(&sendPackage, TOS_NODE_ID, package->src, MAX_TTL, PROTOCOL_TCP, call seqNumbers.get(TOS_NODE_ID), (uint8_t*)(&tcpPack), PACKET_MAX_PAYLOAD_SIZE);
+                    //forward if destination in route table
+                    if(call routeTable.contains(package->src)) {
+                        call Sender.send(sendPackage, call routeTable.get(package->src));
+                        dbg(GENERAL_CHANNEL, "SYN_ACK Packet sent to Node %d\n", call routeTable.get(package->src));                        
+                    }
+                    //flood if destination not in route table
+                    else {
+                        call Sender.send(sendPackage, AM_BROADCAST_ADDR);
+                        dbg(FLOODING_CHANNEL, "SYN_ACK Packet Flooded\n"); 
+                    }
+                    call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
+                    sockets[i].state = SYN_RCVD;
+                    packetTimer = call serverTimer.getNow();
+                    return SUCCESS;
+                }
+            }
+            return FAIL;
+        }
+        else if(tcp->flag == SYN_ACK) {
+            for(i = 0; i < MAX_NUM_OF_SOCKETS; i++) {
+                if(sockets[i].dest.port == tcp->destPort && sockets[i].state == SYN_SENT) {
+                    //send ACK
+                    makeTcpPack(&tcpPack, sockets[i].dest.port, tcp->srcPort, 0, 0, 0, ACK, tcp->window, "", PACKET_MAX_PAYLOAD_SIZE);
+                    makePack(&sendPackage, TOS_NODE_ID, package->src, MAX_TTL, PROTOCOL_TCP, call seqNumbers.get(TOS_NODE_ID), (uint8_t*)(&tcpPack), PACKET_MAX_PAYLOAD_SIZE);
+                    //forward if destination in route table
+                    if(call routeTable.contains(package->src)) {
+                        call Sender.send(sendPackage, call routeTable.get(package->src));
+                        dbg(GENERAL_CHANNEL, "ACK Packet sent to Node %d\n", call routeTable.get(package->src));                        
+                    }
+                    //flood if destination not in route table
+                    else {
+                        call Sender.send(sendPackage, AM_BROADCAST_ADDR);
+                        dbg(FLOODING_CHANNEL, "ACK Packet Flooded\n"); 
+                    }
+                    call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
+                    //establish connection and send first data
+                    sockets[i].effectiveWindow = tcp->window;
+                    sockets[i].dest.port = tcp->srcPort;
+                    sockets[i].dest.addr = package->src;
+                    sockets[i].src = tcp->destPort;
+                    sockets[i].state = ESTABLISHED;
+                    dbg(TRANSPORT_CHANNEL, "Test Client is now ESTABLISHED\n");
+                    for(j = 0; j < 128; j++) {
+                        transferBuff[j] = currentTransfer++;
+                    }
+                    fd = i;
+                    data -= write(i, transferBuff, data);
+                    i = fd;
+                    makeTcpPack(&tcpPack, sockets[i].src, sockets[i].dest.port, 0, 0, 0, DATA, tcp->window, sockets[i].sendBuff + tcp->ack, PACKET_MAX_PAYLOAD_SIZE);
+                    makePack(&sendPackage, TOS_NODE_ID, sockets[i].dest.addr, MAX_TTL, PROTOCOL_TCP, call seqNumbers.get(TOS_NODE_ID), (uint8_t*)(&tcpPack), PACKET_MAX_PAYLOAD_SIZE);
+                    sockets[i].lastSent += (sockets[i].effectiveWindow - 1) % 128;
+                    //forward if destination in route table
+                    if(call routeTable.contains(sockets[i].dest.addr)) {
+                        call Sender.send(sendPackage, call routeTable.get(sockets[i].dest.addr));
+                        dbg(GENERAL_CHANNEL, "First DATA Packet sent to Node %d\n", call routeTable.get(sockets[i].dest.addr));                        
+                    }
+                    //flood if destination not in route table
+                    else {
+                        call Sender.send(sendPackage, AM_BROADCAST_ADDR);
+                        dbg(FLOODING_CHANNEL, "First DATA Packet Flooded\n"); 
+                    }
+                    call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
+                    sockets[i].RTT = call clientTimer.getNow() - packetTimer;
+                    timeout = 2 * sockets[i].RTT;
+                    return SUCCESS;
+                }
+            }
+            return FAIL;
+        }
+        else if(tcp->flag == ACK) {
+            for(i = 0; i < MAX_NUM_OF_SOCKETS; i++) {
+                if(sockets[i].dest.port == tcp->destPort && sockets[i].state == SYN_RCVD) {
+                    //Establish server and add accepted socket
+                    sockets[i].effectiveWindow = tcp->window;
+                    sockets[i].src = sockets[i].dest.port;
+                    sockets[i].state = ESTABLISHED;
+                    newSocket = sockets[i];
+                    newSocket.dest.port = tcp->srcPort;
+                    newSocket.dest.addr = package->src;
+                    //insert client socket into next available index of accepted sockets of server
+                    tempSocket = acceptedSockets[i];
+                    for(j = 0; j < MAX_NUM_OF_SOCKETS; j++) {
+                        if(sockets[i].src != tempSocket[j].src) {
+                            acceptedSockets[i][j] = newSocket;
+                            j = MAX_NUM_OF_SOCKETS;
+                        }
+                    }
+                    dbg(TRANSPORT_CHANNEL, "Test Server is now ESTABLISHED\n");
+                    sockets[i].RTT = call serverTimer.getNow()- packetTimer;
+                    timeout = 2 * sockets[i].RTT;
+                    return SUCCESS;
+                }
+            }
+            return FAIL;
+        }
+        else if(tcp->flag == FIN) {
+            for(i = 0; i < MAX_NUM_OF_SOCKETS; i++) {
+                if(sockets[i].src == tcp->destPort && sockets[i].state == ESTABLISHED) {
+                    //send FIN_ACK
+                    makeTcpPack(&tcpPack, sockets[i].src, tcp->srcPort, (tcpPack.seq % 255) + 1, tcpPack.ack, tcpPack.lastAck, FIN_ACK, tcp->window, "", PACKET_MAX_PAYLOAD_SIZE);
+                    makePack(&sendPackage, TOS_NODE_ID, package->src, MAX_TTL, PROTOCOL_TCP, call seqNumbers.get(TOS_NODE_ID), (uint8_t*)(&tcpPack), PACKET_MAX_PAYLOAD_SIZE);
+                    //forward if destination in route table
+                    if(call routeTable.contains(sockets[i].dest.addr)) {
+                        call Sender.send(sendPackage, call routeTable.get(sockets[i].dest.addr));
+                        dbg(FLOODING_CHANNEL, "FIN_ACK Packet sent to Node %d\n", call routeTable.get(sockets[i].dest.addr));                        
+                    }
+                    //flood if destination not in route table
+                    else {
+                        call Sender.send(sendPackage, AM_BROADCAST_ADDR);
+                        dbg(FLOODING_CHANNEL, "FIN_ACK Packet Flooded\n"); 
+                    }
+                    call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
+                    return SUCCESS;
+                }
+            }
+            return FAIL;
+        }
+        else if(tcp->flag == FIN_ACK) {
+            for(i = 0; i < MAX_NUM_OF_SOCKETS; i++) {
+                if(sockets[i].src == tcp->destPort && sockets[i].state == ESTABLISHED) {
+                    //send FINAL_ACK
+                    makeTcpPack(&tcpPack, sockets[i].src, sockets[i].dest.port, (tcpPack.seq % 255) + 1, tcpPack.ack, tcpPack.lastAck, FINAL_ACK, tcp->window, "", PACKET_MAX_PAYLOAD_SIZE);
+                    makePack(&sendPackage, TOS_NODE_ID, sockets[i].dest.addr, MAX_TTL, PROTOCOL_TCP, call seqNumbers.get(TOS_NODE_ID), (uint8_t*)(&tcpPack), PACKET_MAX_PAYLOAD_SIZE);
+                    //forward if destination in route table
+                    if(call routeTable.contains(sockets[i].dest.addr)) {
+                        call Sender.send(sendPackage, call routeTable.get(sockets[i].dest.addr));
+                        dbg(FLOODING_CHANNEL, "FINAL_ACK Packet sent to Node %d\n", call routeTable.get(sockets[i].dest.addr));                        
+                    }
+                    //flood if destination not in route table
+                    else {
+                        call Sender.send(sendPackage, AM_BROADCAST_ADDR);
+                        dbg(FLOODING_CHANNEL, "FINAL_ACK Packet Flooded\n"); 
+                    }
+                    call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
+                    return SUCCESS;
+                }
+            }
+            return FAIL;
+        }
+        else if(tcp->flag == FINAL_ACK) {
+            for(i = 0; i < MAX_NUM_OF_SOCKETS; i++) {
+                if(sockets[i].src == tcp->destPort && sockets[i].state == ESTABLISHED) {
+                    tempSocket = acceptedSockets[i];
+                    for(j = 0; j < MAX_NUM_OF_SOCKETS; j++) {
+                        if(sockets[i].src == tempSocket[j].src && tcp->srcPort == tempSocket[j].dest.port) {   
+                            acceptedSockets[i][j] = null_socket;
+                        }
+                    }
+                    close(i);
+                    return SUCCESS;
+                }
+            }
+            return FAIL;
+        }
+        else if(tcp->flag == DATA) {
+            for(i = 0; i < MAX_NUM_OF_SOCKETS; i++) {
+                if(sockets[i].src == tcp->destPort && sockets[i].state == ESTABLISHED) {
+                    //put payload data into sendBUff
+                    tempSocket = acceptedSockets[i];
+                    for(j = 0; j < MAX_NUM_OF_SOCKETS; j++) {
+                        if(sockets[i].src == tempSocket[j].src && tcp->srcPort == tempSocket[j].dest.port) {   
+                            newSocket = tempSocket[j];
+                            l = j;
+                            j = MAX_NUM_OF_SOCKETS;
+                        }
+                    }
+                    k = 0;
+                    for(j = newSocket.lastRcvd; j < (newSocket.lastRcvd + tcp->window); j++) {
+                        m = j;
+                        if(j >= 128) {
+                            m = j % 128;
+                        }
+                        if(newSocket.flag == 1) {
+                            newSocket.sendBuff[m] = tcp->payload[k];
+                            k++;
+                        }
+                        else {
+                            newSocket.sendBuff[m] = tcp->payload[k];
+                            newSocket.sendBuff[(m+1) % 128] = tcp->payload[k+1];
+                            k += 2;                            
+                        }
+                    }
+                    newSocket.lastRcvd = m;
+                    newSocket.nextExpected = (newSocket.lastRcvd + 1) % 128;
+                    acceptedSockets[i][l] = newSocket;
+                    //send DATA_ACK
+                    makeTcpPack(&tcpPack, tcp->destPort, tcp->srcPort, 0, newSocket.nextExpected, 0, DATA_ACK, tcp->window, "", PACKET_MAX_PAYLOAD_SIZE);
+                    makePack(&sendPackage, TOS_NODE_ID, package->src, MAX_TTL, PROTOCOL_TCP, call seqNumbers.get(TOS_NODE_ID), (uint8_t*)(&tcpPack), PACKET_MAX_PAYLOAD_SIZE);
+                    //forward if destination in route table
+                    if(call routeTable.contains(package->src)) {
+                        call Sender.send(sendPackage, call routeTable.get(package->src));
+                        dbg(FLOODING_CHANNEL, "DATA_ACK Packet sent to Node %d\n", call routeTable.get(package->src));                        
+                    }
+                    //flood if destination not in route table
+                    else {
+                        call Sender.send(sendPackage, AM_BROADCAST_ADDR);
+                        dbg(FLOODING_CHANNEL, "DATA_ACK Packet Flooded\n"); 
+                    }
+                    call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
+                    return SUCCESS;
+                }
+            }
+            return FAIL;
+        }
+        else if(tcp->flag == DATA_ACK) {
+            for(i = 0; i < MAX_NUM_OF_SOCKETS; i++) {
+                if(sockets[i].src == tcp->destPort && sockets[i].dest.port == tcp-> srcPort && sockets[i].state == ESTABLISHED) {
+                    //send DATA
+                    if(sockets[i].lastSent > tcp->ack) {
+                        call clientTimer.startOneShot(0);
+                    }
+                    sockets[i].lastAck = (tcp->ack - 1) % 128; 
+                    makeTcpPack(&tcpPack, sockets[i].src, sockets[i].dest.port, tcp->ack, 0, tcp->ack, DATA, tcp->window, sockets[i].sendBuff + tcp->ack, PACKET_MAX_PAYLOAD_SIZE);
+                    makePack(&sendPackage, TOS_NODE_ID, sockets[i].dest.addr, MAX_TTL, PROTOCOL_TCP, call seqNumbers.get(TOS_NODE_ID), (uint8_t*)(&tcpPack), PACKET_MAX_PAYLOAD_SIZE);
+                    sockets[i].lastSent += (sockets[i].effectiveWindow - 1) % 128;
+                    //forward if destination in route table
+                    if(call routeTable.contains(sockets[i].dest.addr)) {
+                        call Sender.send(sendPackage, call routeTable.get(sockets[i].dest.addr));
+                        dbg(FLOODING_CHANNEL, "DATA Packet sent to Node %d\n", call routeTable.get(sockets[i].dest.addr));                        
+                    }
+                    //flood if destination not in route table
+                    else {
+                        call Sender.send(sendPackage, AM_BROADCAST_ADDR);
+                        dbg(FLOODING_CHANNEL, "DATA Packet Flooded\n"); 
+                    }
+                    call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
+                    return SUCCESS;
+                }
+            }
+            return FAIL;
+        }
+        else {
+            return FAIL;
+        }
+    }
+
+    event void serverTimer.fired() {
+        socket_t newFd = accept(fd);
+        if(newFd < MAX_NUM_OF_SOCKETS) {
+            tempSocket = acceptedSockets[newFd];
+            for(i = 0; i < MAX_NUM_OF_SOCKETS; i ++) {
+                if(sockets[newFd].src == tempSocket[i].src && tempSocket[i].lastRead != tempSocket[i].lastRcvd) {
+                    sockets[newFd].dest = tempSocket[i].dest;
+                    read(newFd, readBuff, tempSocket[i].lastRcvd - tempSocket[i].lastRead + 1);
+                }
+            }
+        }
+    }
+
+    event void clientTimer.fired() {
+        dbg(TRANSPORT_CHANNEL, "Writing...\n");
+        do {
+            if(sockets[fd].lastSent % 127 == 0 || sockets[fd].lastAck % 127 == 0) {
+                for(i = 0; i < 128; i++) {
+                    if(currentTransfer > 255) {
+                        sockets[fd].flag = 1;
+                        transferBuff[i] = currentTransfer >> 8;
+                        transferBuff[i+1] = currentTransfer & 0x00FF;
+                        currentTransfer++;
+                        i++;
+                    }
+                    else {
+                        transferBuff[i] = currentTransfer++;
+                    }
+                }
+                data -= write(fd, transferBuff, data);
+            }
+        } while(data != 0);
+        if(data == 0 && sockets[fd].lastAck == sockets[fd].lastSent && sockets[fd].state != CLOSED) {
+            close(fd);
+            dbg(TRANSPORT_CHANNEL, "CLOSING CLIENT\n");
+        }
     }
 
     event void CommandHandler.setAppServer(){}
 
     event void CommandHandler.setAppClient(){}
 
-    void makePack(pack *Package, uint16_t src, uint16_t dest, uint16_t TTL, uint16_t protocol, uint16_t seq, uint8_t* payload, uint8_t length){
+    void makePack(pack *Package, uint16_t src, uint16_t dest, uint16_t TTL, uint16_t protocol, uint16_t seq, uint8_t* payload, uint8_t length) {
         Package->src = src;
         Package->dest = dest;
         Package->TTL = TTL;
         Package->seq = seq;
         Package->protocol = protocol;
         memcpy(Package->payload, payload, length);
+    }
+
+    void makeTcpPack(tcp_pack *tcpPack, uint8_t srcPort, uint8_t destPort, uint16_t seq, uint16_t ack, uint16_t lastAck, uint8_t flag, uint16_t window, uint8_t *payload, uint8_t length) {
+        tcpPack->srcPort = srcPort;
+        tcpPack->destPort = destPort;
+        tcpPack->seq = seq;
+        tcpPack->ack = ack;
+        tcpPack->lastAck = lastAck;
+        tcpPack->flag = flag;
+        tcpPack->window = window;
+        memcpy(tcpPack->payload, payload, length);
     }
 }

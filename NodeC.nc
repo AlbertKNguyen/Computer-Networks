@@ -39,6 +39,12 @@ implementation {
     components new TimerMilliC() as periodicLinkState;
     Node.periodicLinkState -> periodicLinkState;
 
+    components new TimerMilliC() as serverTimer;
+    Node.serverTimer -> serverTimer;
+   
+    components new TimerMilliC() as clientTimer;
+    Node.clientTimer -> clientTimer;
+
     components RandomC;
     Node.Random -> RandomC;
 

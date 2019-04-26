@@ -53,5 +53,7 @@ typedef struct socket_store_t{
     uint8_t effectiveWindow;
 }socket_store_t;
 
+socket_store_t socket_default = {0, CLOSED, 0, {0}, {0}, 0, 0, 0, {0}, 0, 0, 0, 0, 6};
+socket_store_t null_socket;
 
 #endif
