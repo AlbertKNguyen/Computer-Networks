@@ -23,6 +23,7 @@ implementation {
     components new HashmapC(uint8_t*, 64) as linkState;
     components new HashmapC(uint16_t, 64) as nodeDistance;
     components new HashmapC(uint16_t, 64) as routeTable;
+    components new QueueC(pack, 64) as lastPack;
     components new AMReceiverC(AM_PACK) as GeneralReceive;
 
     Node -> MainC.Boot;
@@ -31,6 +32,7 @@ implementation {
     Node.linkState -> linkState;
     Node.nodeDistance -> nodeDistance;
     Node.routeTable -> routeTable;
+    Node.lastPack -> lastPack;
     Node.Receive -> GeneralReceive;
     
     components new TimerMilliC() as periodicNeighbors;
@@ -44,6 +46,9 @@ implementation {
    
     components new TimerMilliC() as clientTimer;
     Node.clientTimer -> clientTimer;
+
+    components new TimerMilliC() as timeoutTimer;
+    Node.timeoutTimer -> timeoutTimer;
 
     components RandomC;
     Node.Random -> RandomC;

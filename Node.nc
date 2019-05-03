@@ -28,11 +28,13 @@ module Node {
     uses interface Timer<TMilli> as periodicLinkState;
     uses interface Timer<TMilli> as serverTimer;
     uses interface Timer<TMilli> as clientTimer;
+    uses interface Timer<TMilli> as timeoutTimer;
     uses interface List<uint16_t> as neighborsList;
     uses interface Hashmap<uint16_t> as seqNumbers;
     uses interface Hashmap<uint8_t*> as linkState;
     uses interface Hashmap<uint16_t> as nodeDistance;
     uses interface Hashmap<uint16_t> as routeTable;
+    uses interface Queue<pack> as lastPack;
     uses interface SimpleSend as Sender;
 
     uses interface CommandHandler;
@@ -40,6 +42,7 @@ module Node {
 
 implementation {
     pack sendPackage;
+    tcp_pack *lastPacket;
     tcp_pack tcpPack;
     uint8_t transferBuff[128], readBuff[128];
     uint16_t i, j, k, l, m, minNode, min, data, currentTransfer, dataVal;
@@ -456,12 +459,12 @@ implementation {
     error_t connect(socket_t fileD, socket_addr_t *socketAddress) {
         if(fileD < MAX_NUM_OF_SOCKETS && sockets[fileD].state == CLOSED) {
             //Send initial SYN
-            makeTcpPack(&tcpPack, sockets[fileD].dest.port, socketAddress->port, 0, 0, 0, SYN, 8, "", PACKET_MAX_PAYLOAD_SIZE);
+            makeTcpPack(&tcpPack, sockets[fileD].dest.port, socketAddress->port, 0, 0, 0, SYN, 20, "", PACKET_MAX_PAYLOAD_SIZE);
             makePack(&sendPackage, TOS_NODE_ID, socketAddress->addr, MAX_TTL, PROTOCOL_TCP, call seqNumbers.get(TOS_NODE_ID), (uint8_t*)&tcpPack, PACKET_MAX_PAYLOAD_SIZE);
             //forward if destination in route table
             if(call routeTable.contains(socketAddress->addr)) {
                 call Sender.send(sendPackage, call routeTable.get(socketAddress->addr));
-                dbg(FLOODING_CHANNEL, "SYN Packet sent to Node %d\n", call routeTable.get(socketAddress->addr));                        
+                dbg(ROUTING_CHANNEL, "SYN Packet sent to Node %d\n", call routeTable.get(socketAddress->addr));                        
             }
             //flood if destination not in route table
             else {
@@ -470,7 +473,7 @@ implementation {
             }
             call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
             sockets[fileD].state = SYN_SENT;
-            packetTimer = call clientTimer.getNow();
+            packetTimer = call timeoutTimer.getNow();
             return SUCCESS; 
         }
         else {
@@ -501,24 +504,31 @@ implementation {
     error_t close(socket_t fileD) {
         if(fileD < MAX_NUM_OF_SOCKETS) {
             //if client, send FIN
-            if(sockets[fileD].src != sockets[fileD].dest.port) {
-                sockets[fileD].state = CLOSED;
+            if(sockets[fileD].src != sockets[fileD].dest.port && sockets[fileD].state != CLOSE_WAIT) {
+                sockets[fileD].state = CLOSE_WAIT;
                 makeTcpPack(&tcpPack, sockets[fileD].src, sockets[fileD].dest.port, 0, 0, 0, FIN, 0, "", PACKET_MAX_PAYLOAD_SIZE);
-                makePack(&sendPackage, TOS_NODE_ID, sockets[fileD].dest.addr, MAX_TTL, PROTOCOL_TCP, call seqNumbers.get(TOS_NODE_ID), "", PACKET_MAX_PAYLOAD_SIZE);
+                makePack(&sendPackage, TOS_NODE_ID, sockets[fileD].dest.addr, MAX_TTL, PROTOCOL_TCP, call seqNumbers.get(TOS_NODE_ID), (uint8_t*)(&tcpPack), PACKET_MAX_PAYLOAD_SIZE);
                 //forward if destination in route table
                 if(call routeTable.contains(sockets[fileD].dest.addr)) {
                     call Sender.send(sendPackage, call routeTable.get(sockets[fileD].dest.addr));
-                    dbg(FLOODING_CHANNEL, "FIN Packet sent to Node %d\n", call routeTable.get(sockets[fileD].dest.addr));                        
+                    dbg(ROUTING_CHANNEL, "FIN Packet sent to Node %d\n", call routeTable.get(sockets[fileD].dest.addr));                        
                 }
                 //flood if destination not in route table
                 else {
                     call Sender.send(sendPackage, AM_BROADCAST_ADDR);
                     dbg(FLOODING_CHANNEL, "FIN Packet Flooded\n"); 
                 }
+                call lastPack.enqueue(sendPackage);
                 call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
+                sockets[i].RTT = call timeoutTimer.getNow() - packetTimer;
+                timeout = 2 * sockets[i].RTT;
+                call timeoutTimer.startOneShot(timeout);
+                packetTimer = call timeoutTimer.getNow();
             }
-            //if server, just close
+            //else just close
             else{
+                dbg(TRANSPORT_CHANNEL, "Port: %d CLOSED\n", sockets[fileD].src);
+                sockets[fileD].state = CLOSED;
                 sockets[fileD] = socket_default;
                 return SUCCESS;    
             }
@@ -552,7 +562,7 @@ implementation {
             l++;
             dbg(TRANSPORT_CHANNEL, "%d, \n", sockets[fileD].sendBuff[i]);
         }
-        sockets[fileD].lastWritten = i;
+        sockets[fileD].lastWritten = i - 1;
         dbg(TRANSPORT_CHANNEL, "%d Written\n", l);
         return l;
     }
@@ -574,6 +584,7 @@ implementation {
                 i = MAX_NUM_OF_SOCKETS;
             }
         }
+        dbg(TRANSPORT_CHANNEL, "TEST DATA: %d\n", acceptedSockets[fileD][k].rcvdBuff[0]);
         buff = newSocket.rcvdBuff;
         l = 0;
         m = (newSocket.lastRead + 1) % 128;
@@ -583,9 +594,6 @@ implementation {
         dbg(TRANSPORT_CHANNEL, "Reading Data:\n");
         for(i = newSocket.lastRead; i < (newSocket.lastRead + j); i++) {
             dataVal = 0;
-            if(buff[m] == 255 && buff[m-1] == 255) {
-                newSocket.flag = 1;
-            }
             if(newSocket.flag == 1) {
                 dataVal = buff[m];
                 dataVal = dataVal << 8;
@@ -594,6 +602,9 @@ implementation {
             }
             else {
                 dataVal = buff[m];
+            }
+            if(buff[m] == 255 && buff[m-1] == 254) {
+                newSocket.flag = 1;
             }
             dbg(TRANSPORT_CHANNEL, "%d, \n", dataVal);
             l++;
@@ -606,7 +617,7 @@ implementation {
 
     error_t receive(pack* package) {
         tcp_pack *tcp = (tcp_pack*)package->payload;
-        dbg(TRANSPORT_CHANNEL, "TCP Packet Received with Flag: %hhu SrcPort: %hhu DestPort: %hhu\n", tcp->flag, tcp->srcPort, tcp->destPort);
+        dbg(TRANSPORT_CHANNEL, "TCP Packet Received with Flag: %hhu Seq: %hhu Ack: %hhu SrcPort: %hhu DestPort: %hhu\n", tcp->flag, tcp->seq, tcp->ack, tcp->srcPort, tcp->destPort);
         if(tcp->flag == SYN) {
             for(i = 0; i < MAX_NUM_OF_SOCKETS; i++) {
                 if(sockets[i].dest.port == tcp->destPort && sockets[i].state == LISTEN) {
@@ -616,7 +627,7 @@ implementation {
                     //forward if destination in route table
                     if(call routeTable.contains(package->src)) {
                         call Sender.send(sendPackage, call routeTable.get(package->src));
-                        dbg(GENERAL_CHANNEL, "SYN_ACK Packet sent to Node %d\n", call routeTable.get(package->src));                        
+                        dbg(ROUTING_CHANNEL, "SYN_ACK Packet sent to Node %d\n", call routeTable.get(package->src));                        
                     }
                     //flood if destination not in route table
                     else {
@@ -625,7 +636,7 @@ implementation {
                     }
                     call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
                     sockets[i].state = SYN_RCVD;
-                    packetTimer = call serverTimer.getNow();
+                    packetTimer = call timeoutTimer.getNow();
                     return SUCCESS;
                 }
             }
@@ -640,7 +651,7 @@ implementation {
                     //forward if destination in route table
                     if(call routeTable.contains(package->src)) {
                         call Sender.send(sendPackage, call routeTable.get(package->src));
-                        dbg(GENERAL_CHANNEL, "ACK Packet sent to Node %d\n", call routeTable.get(package->src));                        
+                        dbg(ROUTING_CHANNEL, "ACK Packet sent to Node %d\n", call routeTable.get(package->src));                        
                     }
                     //flood if destination not in route table
                     else {
@@ -667,16 +678,19 @@ implementation {
                     //forward if destination in route table
                     if(call routeTable.contains(sockets[i].dest.addr)) {
                         call Sender.send(sendPackage, call routeTable.get(sockets[i].dest.addr));
-                        dbg(GENERAL_CHANNEL, "First DATA Packet sent to Node %d\n", call routeTable.get(sockets[i].dest.addr));                        
+                        dbg(ROUTING_CHANNEL, "First DATA Packet sent to Node %d\n", call routeTable.get(sockets[i].dest.addr));                        
                     }
                     //flood if destination not in route table
                     else {
                         call Sender.send(sendPackage, AM_BROADCAST_ADDR);
                         dbg(FLOODING_CHANNEL, "First DATA Packet Flooded\n"); 
                     }
+                    call lastPack.enqueue(sendPackage);
                     call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
-                    sockets[i].RTT = call clientTimer.getNow() - packetTimer;
+                    sockets[i].RTT = call timeoutTimer.getNow() - packetTimer;
                     timeout = 2 * sockets[i].RTT;
+                    call timeoutTimer.startOneShot(timeout);
+                    packetTimer = call timeoutTimer.getNow();
                     return SUCCESS;
                 }
             }
@@ -701,8 +715,6 @@ implementation {
                         }
                     }
                     dbg(TRANSPORT_CHANNEL, "Test Server is now ESTABLISHED\n");
-                    sockets[i].RTT = call serverTimer.getNow()- packetTimer;
-                    timeout = 2 * sockets[i].RTT;
                     return SUCCESS;
                 }
             }
@@ -717,14 +729,20 @@ implementation {
                     //forward if destination in route table
                     if(call routeTable.contains(sockets[i].dest.addr)) {
                         call Sender.send(sendPackage, call routeTable.get(sockets[i].dest.addr));
-                        dbg(FLOODING_CHANNEL, "FIN_ACK Packet sent to Node %d\n", call routeTable.get(sockets[i].dest.addr));                        
+                        dbg(ROUTING_CHANNEL, "FIN_ACK Packet sent to Node %d\n", call routeTable.get(sockets[i].dest.addr));                        
                     }
                     //flood if destination not in route table
                     else {
                         call Sender.send(sendPackage, AM_BROADCAST_ADDR);
                         dbg(FLOODING_CHANNEL, "FIN_ACK Packet Flooded\n"); 
                     }
+                    sockets[i].state = CLOSE_WAIT;
+                    call lastPack.enqueue(sendPackage);
                     call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
+                    sockets[i].RTT = call timeoutTimer.getNow() - packetTimer;
+                    timeout = 2 * sockets[i].RTT;
+                    call timeoutTimer.startOneShot(timeout);
+                    packetTimer = call timeoutTimer.getNow();
                     return SUCCESS;
                 }
             }
@@ -732,14 +750,14 @@ implementation {
         }
         else if(tcp->flag == FIN_ACK) {
             for(i = 0; i < MAX_NUM_OF_SOCKETS; i++) {
-                if(sockets[i].src == tcp->destPort && sockets[i].state == ESTABLISHED) {
+                if(sockets[i].src == tcp->destPort && sockets[i].state == CLOSE_WAIT) {
                     //send FINAL_ACK
                     makeTcpPack(&tcpPack, sockets[i].src, sockets[i].dest.port, (tcpPack.seq % 255) + 1, tcpPack.ack, tcpPack.lastAck, FINAL_ACK, tcp->window, "", PACKET_MAX_PAYLOAD_SIZE);
                     makePack(&sendPackage, TOS_NODE_ID, sockets[i].dest.addr, MAX_TTL, PROTOCOL_TCP, call seqNumbers.get(TOS_NODE_ID), (uint8_t*)(&tcpPack), PACKET_MAX_PAYLOAD_SIZE);
                     //forward if destination in route table
                     if(call routeTable.contains(sockets[i].dest.addr)) {
                         call Sender.send(sendPackage, call routeTable.get(sockets[i].dest.addr));
-                        dbg(FLOODING_CHANNEL, "FINAL_ACK Packet sent to Node %d\n", call routeTable.get(sockets[i].dest.addr));                        
+                        dbg(ROUTING_CHANNEL, "FINAL_ACK Packet sent to Node %d\n", call routeTable.get(sockets[i].dest.addr));                        
                     }
                     //flood if destination not in route table
                     else {
@@ -747,6 +765,7 @@ implementation {
                         dbg(FLOODING_CHANNEL, "FINAL_ACK Packet Flooded\n"); 
                     }
                     call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
+                    close(i);
                     return SUCCESS;
                 }
             }
@@ -754,14 +773,14 @@ implementation {
         }
         else if(tcp->flag == FINAL_ACK) {
             for(i = 0; i < MAX_NUM_OF_SOCKETS; i++) {
-                if(sockets[i].src == tcp->destPort && sockets[i].state == ESTABLISHED) {
+                if(sockets[i].src == tcp->destPort && sockets[i].state == CLOSE_WAIT) {
                     tempSocket = acceptedSockets[i];
                     for(j = 0; j < MAX_NUM_OF_SOCKETS; j++) {
-                        if(sockets[i].src == tempSocket[j].src && tcp->srcPort == tempSocket[j].dest.port) {   
+                        if(sockets[i].src == tempSocket[j].src && tcp->srcPort == tempSocket[j].dest.port) {  
+                            dbg(TRANSPORT_CHANNEL, "SERVER CONNECTION TO PORT: %d CLOSED\n", tcp->srcPort); 
                             acceptedSockets[i][j] = null_socket;
                         }
                     }
-                    close(i);
                     return SUCCESS;
                 }
             }
@@ -781,21 +800,18 @@ implementation {
                     }
                     k = 0;
                     for(j = newSocket.lastRcvd; j < (newSocket.lastRcvd + tcp->window); j++) {
-                        m = j;
-                        if(j >= 128) {
-                            m = j % 128;
-                        }
-                        if(newSocket.flag == 1) {
-                            newSocket.sendBuff[m] = tcp->payload[k];
-                            k++;
-                        }
-                        else {
-                            newSocket.sendBuff[m] = tcp->payload[k];
-                            newSocket.sendBuff[(m+1) % 128] = tcp->payload[k+1];
-                            k += 2;                            
-                        }
+                        m = j + 1;
+                        if(newSocket.lastRead == 0 && tcp->payload[k] == 1) {
+                            m--;
+                        }                   
+                        if(j >= 127) {
+                            m = (j + 1) % 128;
+                        } 
+                        newSocket.sendBuff[m] = tcp->payload[k];
+                        k++;                         
+                        dbg(TRANSPORT_CHANNEL, "RCVD DATA: %d\n", newSocket.sendBuff[m]);
                     }
-                    newSocket.lastRcvd = m;
+                    newSocket.lastRcvd = (m) % 128;
                     newSocket.nextExpected = (newSocket.lastRcvd + 1) % 128;
                     acceptedSockets[i][l] = newSocket;
                     //send DATA_ACK
@@ -804,14 +820,19 @@ implementation {
                     //forward if destination in route table
                     if(call routeTable.contains(package->src)) {
                         call Sender.send(sendPackage, call routeTable.get(package->src));
-                        dbg(FLOODING_CHANNEL, "DATA_ACK Packet sent to Node %d\n", call routeTable.get(package->src));                        
+                        dbg(ROUTING_CHANNEL, "DATA_ACK Packet sent to Node %d\n", call routeTable.get(package->src));                        
                     }
                     //flood if destination not in route table
                     else {
                         call Sender.send(sendPackage, AM_BROADCAST_ADDR);
                         dbg(FLOODING_CHANNEL, "DATA_ACK Packet Flooded\n"); 
                     }
+                    call lastPack.enqueue(sendPackage);
                     call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
+                    sockets[i].RTT = call timeoutTimer.getNow() - packetTimer;
+                    timeout = 2 * sockets[i].RTT;
+                    call timeoutTimer.startOneShot(timeout);
+                    packetTimer = call timeoutTimer.getNow();
                     return SUCCESS;
                 }
             }
@@ -824,22 +845,34 @@ implementation {
                     if(sockets[i].lastSent > tcp->ack) {
                         call clientTimer.startOneShot(0);
                     }
-                    sockets[i].lastAck = (tcp->ack - 1) % 128; 
-                    makeTcpPack(&tcpPack, sockets[i].src, sockets[i].dest.port, tcp->ack, 0, tcp->ack, DATA, tcp->window, sockets[i].sendBuff + tcp->ack, PACKET_MAX_PAYLOAD_SIZE);
-                    makePack(&sendPackage, TOS_NODE_ID, sockets[i].dest.addr, MAX_TTL, PROTOCOL_TCP, call seqNumbers.get(TOS_NODE_ID), (uint8_t*)(&tcpPack), PACKET_MAX_PAYLOAD_SIZE);
-                    sockets[i].lastSent += (sockets[i].effectiveWindow - 1) % 128;
-                    //forward if destination in route table
-                    if(call routeTable.contains(sockets[i].dest.addr)) {
-                        call Sender.send(sendPackage, call routeTable.get(sockets[i].dest.addr));
-                        dbg(FLOODING_CHANNEL, "DATA Packet sent to Node %d\n", call routeTable.get(sockets[i].dest.addr));                        
+                    sockets[i].lastAck = (tcp->ack - 1) % 128;
+                    if(sockets[i].lastWritten > sockets[i].lastAck || data != 0) {
+                        if((sockets[i].lastWritten - sockets[i].lastAck) >= 6) {
+                            makeTcpPack(&tcpPack, sockets[i].src, sockets[i].dest.port, tcp->ack, 0, tcp->ack, DATA, tcp->window, sockets[i].sendBuff + tcp->ack, PACKET_MAX_PAYLOAD_SIZE);
+                        }
+                        else {
+                            makeTcpPack(&tcpPack, sockets[i].src, sockets[i].dest.port, tcp->ack, 0, tcp->ack, DATA, sockets[i].lastWritten - sockets[i].lastAck, sockets[i].sendBuff + tcp->ack, PACKET_MAX_PAYLOAD_SIZE);
+                        }
+                        makePack(&sendPackage, TOS_NODE_ID, sockets[i].dest.addr, MAX_TTL, PROTOCOL_TCP, call seqNumbers.get(TOS_NODE_ID), (uint8_t*)(&tcpPack), PACKET_MAX_PAYLOAD_SIZE);
+                        sockets[i].lastSent += (sockets[i].effectiveWindow - 1) % 128;
+                        //forward if destination in route table
+                        if(call routeTable.contains(sockets[i].dest.addr)) {
+                            call Sender.send(sendPackage, call routeTable.get(sockets[i].dest.addr));
+                            dbg(ROUTING_CHANNEL, "DATA Packet sent to Node %d\n", call routeTable.get(sockets[i].dest.addr));                        
+                        }
+                        //flood if destination not in route table
+                        else {
+                            call Sender.send(sendPackage, AM_BROADCAST_ADDR);
+                            dbg(FLOODING_CHANNEL, "DATA Packet Flooded\n"); 
+                        }
+                        call lastPack.enqueue(sendPackage);
+                        call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
+                        sockets[i].RTT = call timeoutTimer.getNow() - packetTimer;
+                        timeout = 2 * sockets[i].RTT;
+                        call timeoutTimer.startOneShot(timeout);
+                        packetTimer = call timeoutTimer.getNow();
+                        return SUCCESS;
                     }
-                    //flood if destination not in route table
-                    else {
-                        call Sender.send(sendPackage, AM_BROADCAST_ADDR);
-                        dbg(FLOODING_CHANNEL, "DATA Packet Flooded\n"); 
-                    }
-                    call seqNumbers.insert(TOS_NODE_ID, call seqNumbers.get(TOS_NODE_ID) + 1);
-                    return SUCCESS;
                 }
             }
             return FAIL;
@@ -863,9 +896,9 @@ implementation {
     }
 
     event void clientTimer.fired() {
-        dbg(TRANSPORT_CHANNEL, "Writing...\n");
+        dbg(TRANSPORT_CHANNEL, "Client Fired\n");
         do {
-            if(sockets[fd].lastSent % 127 == 0 || sockets[fd].lastAck % 127 == 0) {
+            if((sockets[fd].lastSent % 127 == 0 || sockets[fd].lastAck % 127 == 0) && sockets[fd].state == ESTABLISHED) {
                 for(i = 0; i < 128; i++) {
                     if(currentTransfer > 255) {
                         sockets[fd].flag = 1;
@@ -881,11 +914,37 @@ implementation {
                 data -= write(fd, transferBuff, data);
             }
         } while(data != 0);
-        if(data == 0 && sockets[fd].lastAck == sockets[fd].lastSent && sockets[fd].state != CLOSED) {
+        if(data == 0 && sockets[fd].lastAck == sockets[fd].lastWritten && sockets[fd].state == ESTABLISHED) {
             close(fd);
             dbg(TRANSPORT_CHANNEL, "CLOSING CLIENT\n");
         }
     }
+
+    event void timeoutTimer.fired() {
+        pack lastPackage = call lastPack.head();
+        tcp_pack *tcp = (tcp_pack*)lastPackage.payload;
+        call lastPack.dequeue();
+        for(i = 0; i < MAX_NUM_OF_SOCKETS;i ++) {
+            if(sockets[i].src == tcp->srcPort) {
+                fd = i;
+                i = MAX_NUM_OF_SOCKETS;
+            }
+        }
+        //resend packet if not acked
+        if(sockets[fd].lastAck < tcp->seq) {
+            //forward if destination in route table
+            if(call routeTable.contains(lastPackage.dest)) {
+                call Sender.send(sendPackage, call routeTable.get(lastPackage.dest));
+                dbg(ROUTING_CHANNEL, "DATA Packet sent to Node %d\n", call routeTable.get(lastPackage.dest));                        
+            }
+            //flood if destination not in route table
+            else {
+                call Sender.send(sendPackage, AM_BROADCAST_ADDR);
+                dbg(FLOODING_CHANNEL, "DATA Packet Flooded\n"); 
+            }
+        }
+    }
+
 
     event void CommandHandler.setAppServer(){}
 
