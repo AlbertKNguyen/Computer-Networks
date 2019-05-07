@@ -584,7 +584,7 @@ implementation {
                 i = MAX_NUM_OF_SOCKETS;
             }
         }
-        dbg(TRANSPORT_CHANNEL, "TEST DATA: %d\n", acceptedSockets[fileD][k].rcvdBuff[0]);
+        dbg(TRANSPORT_CHANNEL, "TEST DATA: %d\n", acceptedSockets[fileD][0].rcvdBuff[0]);
         buff = newSocket.rcvdBuff;
         l = 0;
         m = (newSocket.lastRead + 1) % 128;
@@ -811,6 +811,9 @@ implementation {
                         k++;                         
                         dbg(TRANSPORT_CHANNEL, "RCVD DATA: %d\n", newSocket.sendBuff[m]);
                     }
+                    if(tcp->seq == 0) {
+                        m--;
+                    }
                     newSocket.lastRcvd = (m) % 128;
                     newSocket.nextExpected = (newSocket.lastRcvd + 1) % 128;
                     acceptedSockets[i][l] = newSocket;
@@ -896,7 +899,7 @@ implementation {
     }
 
     event void clientTimer.fired() {
-        dbg(TRANSPORT_CHANNEL, "Client Fired\n");
+        //dbg(TRANSPORT_CHANNEL, "Client Fired\n");
         do {
             if((sockets[fd].lastSent % 127 == 0 || sockets[fd].lastAck % 127 == 0) && sockets[fd].state == ESTABLISHED) {
                 for(i = 0; i < 128; i++) {
