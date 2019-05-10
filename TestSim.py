@@ -16,6 +16,12 @@ class TestSim:
     CMD_ROUTE_DUMP = 3
     CMD_TEST_CLIENT = 4
     CMD_TEST_SERVER = 5
+    CMD_CLOSE_CLIENT = 6
+    CMD_APP_CLIENT = 7
+    CMD_APP_SERVER = 8
+    CMD_BROADCAST = 9
+    CMD_WHISPER = 10
+    CMD_LIST_USERS = 11
     
     # CHANNELS - see includes/channels.h
     COMMAND_CHANNEL="command";
@@ -137,8 +143,23 @@ class TestSim:
     def setTestClient(self, ID, dest, srcPort, destPort, transfer):
         self.sendCMD(self.CMD_TEST_CLIENT, ID, "{0}{1}{2}{3}{4}".format(chr(dest), chr(srcPort), chr(destPort), chr(transfer), "client command"));
         
-    def closeTestClient(self, ID, dest, srcPort, destPort):
+    def closeClient(self, ID, dest, srcPort, destPort):
         self.sendCMD(self.CMD_CLOSE_CLIENT, ID, "{0}{1}{2}{3}".format(chr(dest), chr(srcPort), chr(destPort), "client command"));
+
+    def setAppServer(self, ID, port):
+        self.sendCMD(self.CMD_APP_SERVER, ID, "{0}{1}".format(chr(port), "server command"));
+
+    def setAppClient(self, ID, dest, srcPort, destPort, username):
+        self.sendCMD(self.CMD_APP_CLIENT, ID, "{0}{1}{2}{3}".format(chr(dest), chr(srcPort), chr(destPort), username));
+        
+    def broadcastMessage(self, ID, port, msg):
+        self.sendCMD(self.CMD_BROADCAST, ID, "{0}{1}".format(chr(port), msg));
+
+    def whisperMessage(self, ID, port, username, msg):
+        self.sendCMD(self.CMD_WHISPER, ID, "{0}{1}{2}".format(chr(port), username, msg));
+    
+    def listUsers(self, ID, port):
+         self.sendCMD(self.CMD_LIST_USERS, ID, "{0}".format(chr(port)));
 
     def addChannel(self, channelName, out=sys.stdout):
         print 'Adding Channel', channelName;
@@ -153,16 +174,24 @@ def main():
     s.addChannel(s.COMMAND_CHANNEL);
     s.addChannel(s.GENERAL_CHANNEL);
     s.addChannel(s.NEIGHBOR_CHANNEL);
-    #s.addChannel(s.FLOODING_CHANNEL);
+    s.addChannel(s.FLOODING_CHANNEL);
     s.addChannel(s.ROUTING_CHANNEL);
     s.addChannel(s.TRANSPORT_CHANNEL);
     s.runTime(20);
     s.ping(1, 5, "Hello, World?");
-    s.runTime(100);
-    s.setTestServer(5, 23);
     s.runTime(10);
-    s.setTestClient(1, 5, 123, 23, 40);
+    s.setAppServer(5, 23);
+    s.runTime(10);
+    s.setAppClient(1, 5, 41, 23, "albert");
+    #s.runTime(100);
+    #s.setAppClient(3, 5, 37, 23, "brian");
     s.runTime(100);
+    #s.broadcastMessage(1, 41, "Pomegranate");
+    #s.runTime(100);
+    #s.whisperMessage(3, 37, "brian", "Mango");
+    #s.runTime(100);
+    s.listUsers(1, 41);
+    s.runTime(10);
 
 if __name__ == '__main__':
     main()
